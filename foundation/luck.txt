@@ -1,0 +1,294 @@
+# -*- coding: utf-8 -*-
+import sys
+from datetime import datetime, timedelta
+from PyQt5.QtWidgets import QApplication
+from PyQt5.QAxContainer import QAxWidget
+from PyQt5.QtCore import QTimer
+
+# ===== 사용자 지정 종목명 목록 =====
+TARGET_NAMES = [
+    "LG에너지솔루션","HD현대중공업","두산에너빌리티","한화오션","NAVER","카카오","POSCO홀딩스",
+    "현대로템","고려아연","SK이노베이션","SK","LG화학","삼성SDI","KT&G","에코프로비엠",
+    "한화시스템","삼성에스디에스","대한항공","LS ELECTRIC","현대제철","엔씨소프트","두산로보틱스",
+    "HD현대미포","SK바이오팜","현대오토에버","LG이노텍","한전기술","현대엘리베이터"
+]
+# 중복 제거
+TARGET_NAMES = list(dict.fromkeys(TARGET_NAMES))
+
+# ===== 화면번호/요청명 =====
+SCREEN_INFO = "9001"            # opt10001 (현재가/거래량 등)
+SCREEN_BRKR = "9101"            # opt10002 (거래원 상위)
+RQ_INFO     = "rq_basic_info"
+RQ_BRKR     = "rq_broker_rank"
+
+# ===== 요청 간격(ms) =====
+REQ_INTERVAL_MS = 200
+
+def safe_filename(name: str) -> str:
+    for ch in '\\/:*?"<>|':
+        name = name.replace(ch, '_')
+    return name.strip()
+
+class KiwoomMinuteCollector:
+    """
+    09:00~15:30, 1분 간격으로
+      - opt10002: 매수/매도 거래원 상위 5 (KRX 기준)
+      - opt10001: 현재가, 거래량(누적)
+    을 조회해 종목별 TXT로 저장.
+    """
+    def __init__(self):
+        self.app = QApplication(sys.argv)
+        self.ocx = QAxWidget("KHOPENAPI.KHOpenAPICtrl.1")
+        self.ocx.OnEventConnect.connect(self._on_login)
+        self.ocx.OnReceiveTrData.connect(self._on_tr)
+
+        # 상태
+        self.name_to_code = {}
+        self.targets = []               # [(name, code)]
+        self.req_busy = False
+        self.req_queue = []             # [(kind, code, name, tlabel)]
+        self.curr_req  = None
+
+        # 샘플 버퍼: {(code, tlabel): {"price":int|None, "vol":int|None, "buy_top":list|None, "sell_top":list|None}}
+        self.samples = {}
+
+        # 타이머
+        self.pump_timer = QTimer()
+        self.pump_timer.timeout.connect(self._pump)
+
+        self.clock_timer = QTimer()
+        self.clock_timer.timeout.connect(self._on_minute_tick)
+
+        # 수집 시간
+        self.start_hm = (9, 0)
+        self.end_hm   = (15, 30)
+
+    def run(self):
+        self.ocx.dynamicCall("CommConnect()")
+        self.app.exec_()
+
+    # ================= 로그인 =================
+    def _on_login(self, err_code):
+        if err_code != 0:
+            print("로그인 실패")
+            self.app.quit(); return
+        print("로그인 성공")
+
+        kospi_codes  = self._get_codes_by_market("0")
+        kosdaq_codes = self._get_codes_by_market("10")
+        all_codes = kospi_codes + kosdaq_codes
+
+        master_map = {}
+        for code in all_codes:
+            name = self.ocx.dynamicCall("GetMasterCodeName(QString)", code)
+            master_map[name] = code
+
+        not_found = []
+        for nm in TARGET_NAMES:
+            code = master_map.get(nm)
+            if code:
+                self.name_to_code[nm] = code
+                self.targets.append((nm, code))
+            else:
+                not_found.append(nm)
+
+        if not self.targets:
+            print("대상 종목 매핑 실패. 이름을 확인하세요.")
+            self.app.quit(); return
+
+        print("=== 대상 종목 매핑 ===")
+        for nm, cd in self.targets:
+            print(f"{nm} -> {cd}")
+        if not_found:
+            print("\n[경고] 매핑 실패:", ", ".join(not_found))
+
+        self._start_schedulers()
+
+    def _get_codes_by_market(self, market_str):
+        codes_str = self.ocx.dynamicCall("GetCodeListByMarket(QString)", market_str)
+        return [c for c in codes_str.split(';') if c]
+
+    # ================ 스케줄/펌프 =================
+    def _start_schedulers(self):
+        now = datetime.now()
+        today = now.date()
+        start_dt = datetime(today.year, today.month, today.day, *self.start_hm)
+        end_dt   = datetime(today.year, today.month, today.day, *self.end_hm)
+
+        if now > end_dt:
+            print("현재 15:30 이후입니다. 종료.")
+            self.app.quit(); return
+
+        self.pump_timer.start(REQ_INTERVAL_MS)
+
+        if now < start_dt:
+            wait_ms = int((start_dt - now).total_seconds() * 1000)
+            print(f"09:00까지 대기… ({wait_ms/1000:.0f}s)")
+            QTimer.singleShot(wait_ms, self._on_minute_tick)
+        else:
+            next_min = (now.replace(second=0, microsecond=0) + timedelta(minutes=1))
+            wait_ms = max(0, int((next_min - now).total_seconds() * 1000))
+            print(f"첫 수집까지 {wait_ms/1000:.0f}s 대기")
+            QTimer.singleShot(wait_ms, self._on_minute_tick)
+
+        self.clock_timer.start(60_000)
+
+    def _on_minute_tick(self):
+        now = datetime.now()
+        today = now.date()
+        end_dt = datetime(today.year, today.month, today.day, *self.end_hm)
+
+        if now > end_dt:
+            print("수집 종료 (15:30 도달).")
+            self.clock_timer.stop()
+            if not self.req_queue and not self.req_busy:
+                self.app.quit()
+            else:
+                QTimer.singleShot(5_000, self._try_quit_when_idle)
+            return
+
+        # 분 라벨
+        tlabel = now.replace(second=0, microsecond=0).strftime("%Y-%m-%d %H:%M")
+
+        # 종목별로 거래원→정보 순서로 큐 적재
+        for name, code in self.targets:
+            key = (code, tlabel)
+            self.samples[key] = {"price": None, "vol": None, "buy_top": None, "sell_top": None}
+            self.req_queue.append(("brkr", code, name, tlabel))
+            self.req_queue.append(("info", code, name, tlabel))
+
+        print(f"[{tlabel}] 요청 적재: {len(self.req_queue)}건 (대상 {len(self.targets)}종목 × 2)")
+
+    def _try_quit_when_idle(self):
+        if not self.req_queue and not self.req_busy:
+            print("모든 요청 처리 완료 → 종료")
+            self.app.quit()
+        else:
+            QTimer.singleShot(3_000, self._try_quit_when_idle)
+
+    def _pump(self):
+        if self.req_busy or not self.req_queue:
+            return
+        kind, code, name, tlabel = self.req_queue.pop(0)
+        self.req_busy = True
+        self.curr_req = {"kind": kind, "code": code, "name": name, "tlabel": tlabel}
+
+        self.ocx.dynamicCall("SetInputValue(QString, QString)", "종목코드", code)
+
+        if kind == "info":
+            self.ocx.dynamicCall("CommRqData(QString, QString, int, QString)",
+                                 RQ_INFO, "opt10001", 0, SCREEN_INFO)
+        elif kind == "brkr":
+            self.ocx.dynamicCall("CommRqData(QString, QString, int, QString)",
+                                 RQ_BRKR, "opt10002", 0, SCREEN_BRKR)
+        else:
+            self.req_busy = False
+            self.curr_req = None
+
+    # ================= 수신 핸들러 =================
+    def _on_tr(self, screen_no, rqname, trcode, recordname, prev_next,
+               data_len, error_code, message, splm_msg):
+        try:
+            if not self.curr_req:
+                self.req_busy = False
+                return
+
+            kind   = self.curr_req["kind"]
+            code   = self.curr_req["code"]
+            name   = self.curr_req["name"]
+            tlabel = self.curr_req["tlabel"]
+            key    = (code, tlabel)
+
+            if rqname == RQ_INFO and kind == "info":
+                price = self._get(trcode, rqname, 0, "현재가")
+                vol   = self._get(trcode, rqname, 0, "거래량")
+                self.samples[key]["price"] = self._to_int(price)
+                self.samples[key]["vol"]   = self._to_int(vol)
+
+            elif rqname == RQ_BRKR and kind == "brkr":
+                sell_top = []
+                buy_top  = []
+                for i in range(1, 6):
+                    s_name = self._get(trcode, rqname, 0, f"매도거래원명{i}")
+                    s_vol  = self._get(trcode, rqname, 0, f"매도거래량{i}")
+                    if s_name:
+                        sell_top.append((s_name, self._to_int(s_vol)))
+                for i in range(1, 6):
+                    b_name = self._get(trcode, rqname, 0, f"매수거래원명{i}")
+                    b_vol  = self._get(trcode, rqname, 0, f"매수거래량{i}")
+                    if b_name:
+                        buy_top.append((b_name, self._to_int(b_vol)))
+                self.samples[key]["sell_top"] = sell_top
+                self.samples[key]["buy_top"]  = buy_top
+
+            # 두 TR 모두 수신된 뒤에만 기록
+            data = self.samples.get(key)
+            if data and (data["price"] is not None) and (data["vol"] is not None) \
+                     and (data["buy_top"] is not None) and (data["sell_top"] is not None):
+                self._write_sample(name, tlabel, data)
+                del self.samples[key]
+
+        except Exception as e:
+            print("에러:", e)
+        finally:
+            self.req_busy = False
+            self.curr_req = None
+
+    # ================= 파일 기록 (요청한 포맷) =================
+    def _write_sample(self, name, tlabel, data):
+        """
+        [YYYY-MM-DD HH:MM] 가격: 385,000 / 거래량: 123,456
+        매수 상위:
+          1. ○○증권 25,300
+          ...
+        매도 상위:
+          1. ##증권 22,110
+          ...
+        """
+        fname = safe_filename(name) + ".txt"
+        try:
+            with open(fname, "a", encoding="utf-8") as f:
+                f.write(f"[{tlabel}] 가격: {self._fmt(data['price'])} / 거래량: {self._fmt(data['vol'])}\n")
+                f.write("매수 상위:\n")
+                if data["buy_top"]:
+                    for idx, (bn, bv) in enumerate(data["buy_top"], 1):
+                        f.write(f"  {idx}. {bn} {self._fmt(bv)}\n")
+                else:
+                    f.write("  (데이터 없음)\n")
+                f.write("매도 상위:\n")
+                if data["sell_top"]:
+                    for idx, (sn, sv) in enumerate(data["sell_top"], 1):
+                        f.write(f"  {idx}. {sn} {self._fmt(sv)}\n")
+                else:
+                    f.write("  (데이터 없음)\n")
+            print(f"저장 완료 → {fname} [{tlabel}]")
+        except Exception as e:
+            print(f"파일 저장 실패({fname}):", e)
+
+    # ================= 유틸 =================
+    def _get(self, trcode, rqname, idx, field):
+        return self.ocx.dynamicCall(
+            "GetCommData(QString, QString, int, QString)",
+            trcode, rqname, idx, field
+        ).strip()
+
+    def _to_int(self, s: str) -> int:
+        if s is None:
+            return 0
+        s = s.replace(',', '').replace('+', '').strip()
+        if s.startswith('-'):  # 키움 전일비 등으로 음수 기호가 섞여올 수 있어 제거
+            s = s[1:]
+        try:
+            return int(s or "0")
+        except:
+            return 0
+
+    def _fmt(self, n: int) -> str:
+        try:
+            return f"{n:,}"
+        except:
+            return str(n)
+
+# ================= 진입점 =================
+if __name__ == "__main__":
+    KiwoomMinuteCollector().run()
