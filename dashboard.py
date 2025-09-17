@@ -46,7 +46,7 @@ def load_txt(file_path):
     return pd.DataFrame(rows)
 
 # === 경로 설정 ===
-BASE_PATH = "한국투자증권"
+BASE_PATH = "data"
 date_folders = sorted([f for f in os.listdir(BASE_PATH) if os.path.isdir(os.path.join(BASE_PATH, f))])
 
 # === 사이드바 ===
